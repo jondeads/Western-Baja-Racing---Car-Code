@@ -1,0 +1,1351 @@
+//Official Car Code 2025 containing all processing of data and sending to pi/phone
+
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <TinyGPSPlus.h>
+TinyGPSPlus gps;
+
+// Set to 1 for USB testing so Phone traffic goes through Serial.
+// Set back to 0 for normal car wiring on UART2.
+#define USB_PHONE_DEBUG 0
+
+// When USB_PHONE_DEBUG is 1, this keeps GPS on UART0 and also outputs to USB.
+// Limitation: UART0 has one baud for both directions, so USB monitor must use GPS baud.
+#define USB_SHARE_UART0_WITH_GPS 1
+
+#define GPS_BAUD 9600
+
+#if USB_PHONE_DEBUG
+#define Phone Serial
+#else
+HardwareSerial Phone(2);
+#endif
+HardwareSerial Pi(1);    // Changed from I2C to UART
+HardwareSerial GPS(0);   // use UART0 hardware, but mapped to pins you choose
+
+#define BUTTON_COUNT 4      // Number of buttons
+
+// Pin Definitions ---------------------------------------------------------------
+// Internal Connections
+
+#define battery1 36    
+#define battery2 39  
+#define reverseSignal 15      
+#define gpsTx 1//TX0     //mostly done need to manage inputs from phone
+#define gpsRx 3 //RX0     //mostly done need to manage inputs from phone
+
+#define gyroData 26 //or 23,14,13  might need to be io4 geen
+#define gyroClock 27 //yellow
+
+// ----- IMU (MPU-6050/6500 style) over I2C -----
+#define MPU_ADDR 0x68
+#define PWR_MGMT_1   0x6B
+#define ACCEL_XOUT_H 0x3B
+#define GYRO_XOUT_H  0x43
+TwoWire I2C_IMU = TwoWire(0);  // dedicated I2C bus
+
+//Front Connections
+#define horn 5          //should work i think
+//#define brakePressure1 34
+//#define actuatorWhite 25            
+//#define actuatorYellow 26  //duplicate 27 in google sheet
+//#define actuatorC 27           
+#define piTx 21    // Changed from rasPiSDA to Pi TX
+#define piRx 22    // Changed from rasPiSCL to Pi RX
+
+//Rear Connections
+#define engineKill 18
+#define fuelSens 32        
+#define rpmSens 33      
+#define wheelSpeedSens 35  
+#define backUpExtTx 17 //TX2   need to confirm the esp
+#define backUpExtRx 16 //RX2
+
+//Suspension L pots
+#define lpot1 2     
+#define lpot2 4     
+
+#define ON LOW
+#define OFF HIGH
+
+//Variable Declarations -------------------------------------------------------------
+RTC_DATA_ATTR uint32_t bootCount = 0;
+volatile uint8_t aliveStage = 0;
+
+//Internal Variables ---------------------------------------------------
+
+//Battery 1
+int rawBattery1;
+int battPercentage1;
+
+//Battery 2
+int rawBattery2;
+int battPercentage2;
+const int batLowLimit = 2430; // currently value for 16 volts, need to reduce for limit under 12 v
+const int batHighLimit = 3800; //currently 20.5 from old code
+
+//gyroscope values
+int16_t ax=0, ay=0, az=0;
+int16_t gx=0, gy=0, gz=0;
+int imuOK = 0;   // 1 if responding, else 0
+
+//GPS module variables
+float gpsLat = 0.0f;
+float gpsLon = 0.0f;
+float gpsSpeedKph = 0.0f;
+uint8_t gpsSats = 0;
+float gpsHdop = 99.9f;
+float gpsAltM = 0.0f;
+uint8_t gpsFix = 0;   // 0/1
+static char lastNMEA[96] = "";     // last filtered sentence (sanitized)
+static uint32_t lastNMEAMs = 0;    // when it was updated
+
+
+//input variables-----------------------------------------------------------
+
+//front Diff position
+int diffPosition;       //0 is 2wd, 1 is 4wd, 2 is 4wd lock
+int changingState = 0;
+
+//fuel variables
+unsigned long fuelStart;
+unsigned long fuelEnd;
+int fuelTime;
+int rawFuel = 0;
+int fuelFlag = 0;
+int newFuelTime = 0;
+int fuel = 0;
+const int fuelLowLimit = 1000;  // semi-calibrated value
+const int fuelHighLimit = 1545; // calibrated value
+
+// Engine RPM variables:
+unsigned long rpmPulseTime;
+unsigned long rpmPrevPulseTime;
+unsigned long magFreq;
+const int magnetDebounce = 3000; // 3ms to reduce noise
+const int magnets = 1;
+int rpm = 0;
+unsigned long magInterval = 0;
+int motorLocation = 0;
+
+//wheel speed variables
+float wheelSpeed = 0;
+const int teeth = 17;             // Number of teeth per rotation
+volatile unsigned long wheelPulseTime = 0;
+volatile unsigned long wheelPrevPulseTime = 0;
+volatile unsigned long toothInterval = 0;
+unsigned long toothFreq;
+const int wheelDebounce = 150; // 150ms to reduce noise
+const int tireSize = 23;                         //other options 21.75, 22.5, 25
+const double wheelRatio = 0.001232595 * tireSize;
+
+//shock positions
+int shockPos1 = 0;
+int shockPos2 = 0;
+int rawShockPos1 = 0;
+int rawShockPos2 = 0;
+
+//flags
+int reverseFlag = 0;
+
+//engine limiter variables
+int limitRPM = 2100;
+const int allowRev = 1; // Flag to allow rev limiter to be active
+
+// ------------------- Phone communication -------------------
+int acknowledged = 0;
+String incomingPhoneData = "";
+unsigned long phoneExportTimer = 0;
+const int phoneExportInterval = 100;      //ms between sending;
+int carNumber = 0;
+long bestLap = 0; // in ms
+long lastLap = 0; // in ms
+long raceTimer = 0; // in ms    holds the total time of race to be sent to pi
+int startSignal = 0; // 0 = no signal, 1 = start signal
+long piTimer = 0; //hold the current timer displayed on the wheel
+
+// ------------------- Pi communication (UART) -------------------
+String incomingPiData = "";
+String piDataString;
+unsigned long piCommTimer = 0;
+const int piCommInterval = 200;  // 40Hz for Pi communication
+const int MAX_PI_BUFFER = 200;  // Prevent runaway buffer growth
+
+int panicStatus = 0;
+int muteStatus = 0;
+int twoStep = 0;
+int hornButton = 0;
+int allowedHorn = 0;    //just to allow horn to be used
+
+//PI button variables
+uint8_t lastButtonStates = 0;  // Stores previous button states
+unsigned long button1PressTime = 0;
+bool button1Held = false;
+bool lastButton2State = false;
+int speed = 0;
+int DiffStatus = 0;  //diff state. (0 = 2wd, 1 = fwd, 2 = 4lock)
+int lap = 0;
+int gearState = 0;  //gear state. (0 = Neutral, 1 = Forward, 2 = Reverse)
+int mode = 0;       // display mode. (0 for endurance, 1 for dynamic, 2 for focus)
+
+//Phone Data (attained from Phone -> ESP -> Pi)
+int carInFront = 1;
+String pos = "69";
+String posD = "420";
+
+// ---- IMU retry management ----
+static unsigned long imuLastAttemptMs = 0;
+static unsigned long imuRetryIntervalMs = 1000;   // start at 1s
+static const unsigned long IMU_RETRY_MAX_MS = 8000;
+static bool imuEverOK = false;
+
+#define WHO_AM_I      0x75
+
+
+//global Variables
+const int batSamples = 1000; //number of samples for moving average
+const int fuelSamples = 1000; //number of samples for moving average
+int fuelLogger[fuelSamples];  // Array to store PWM samples
+int batLogger1[batSamples];   //array of bat values for moving average
+int batLogger2[batSamples];   
+int batIndex1 = 0;            // Index to keep track of the current sample
+int batIndex2 = 0;            // Index to keep track of the current sample
+int fuelIndex = 0;         // Index to keep track of the current sample
+const int debounce = 20;
+
+//Function prototypes ---------------------------------------------------------------
+void batRead(int batteryPin, int &rawValue, int &percentage, int* logger, int &index); // battery = pin of battery, rawBat = value from sensor, variable = percentage of battery
+void updateBatAverage(int rawValue, int* logger, int &index, int &percentage); // battery = pin of battery, rawBat = value from sensor, variable = percentage of battery
+void readPhoneData(); 
+void processPhoneData(String data); 
+void exportPhoneData();
+void readPiData();
+void processPiData(String data);
+void processPiButtons(uint8_t receivedData);
+void exportPiData();
+void reverseCheck();
+void diffCheck();
+void fuelRead();
+void updateFuelAverage(int newValue);
+void RPMRead();
+void rpmCalculate();
+void wheelSpeedRead();
+void wheelSpeedCalculate();
+void shockRead();
+void honk();
+void revLimiter();
+void formatTime(long timeInMillis, String &formattedTime);
+void formatPidata();
+bool imuPing();
+bool imuWhoAmICheck();
+bool imuTryInit();
+void imuService();
+void imuScanBus();
+void i2cBusRecover(int sda, int scl);
+
+bool imuWriteReg(uint8_t reg, uint8_t val);
+uint8_t imuRead8(uint8_t reg);
+bool readGyro();
+
+bool imuHandleFail();
+
+
+void setup(){
+
+#if USB_PHONE_DEBUG
+  #if USB_SHARE_UART0_WITH_GPS
+    Phone.begin(GPS_BAUD);
+    Phone.println("USB debug mode: UART0 shared with GPS. Open monitor at 9600.");
+  #else
+    Phone.begin(115200);
+    Phone.println("USB debug mode enabled: GPS on UART0 is disabled in this mode.");
+  #endif
+#else
+    Phone.begin(115200, SERIAL_8N1, backUpExtRx, backUpExtTx);
+#endif
+    Pi.begin(115200, SERIAL_8N1, piRx, piTx);  // Initialize Pi UART communication
+
+#if USB_PHONE_DEBUG
+  #if USB_SHARE_UART0_WITH_GPS
+    GPS.begin(GPS_BAUD, SERIAL_8N1, gpsRx, gpsTx);
+  #else
+    // UART0 is used by USB Serial in debug mode, so skip GPS on UART0.
+    // This prevents USB monitor contention while bench testing.
+  #endif
+#else
+    GPS.begin(GPS_BAUD, SERIAL_8N1, gpsRx, gpsTx);  // L76K default is often 9600
+#endif
+
+    bootCount++;
+
+
+    I2C_IMU.begin(gyroData, gyroClock, 25000);   // slower for robustness
+    I2C_IMU.setTimeout(2);
+    delay(50);
+
+    i2cBusRecover(gyroData, gyroClock);
+    delay(10);
+
+    I2C_IMU.end();
+    delay(5);
+    I2C_IMU.begin(gyroData, gyroClock, 25000);
+    I2C_IMU.setTimeout(2);
+    delay(50);
+
+    imuScanBus();
+
+    imuOK = imuTryInit() ? 1 : 0;
+    if (imuOK) {
+      imuEverOK = true;
+      Phone.println("GyroConnected");
+    } else {
+      Phone.println("Gyro init failed, will retry...");
+    }
+
+    incomingPhoneData.reserve(128);
+    incomingPiData.reserve(256);
+    piDataString.reserve(256);
+    
+    // Initialize battery samples array
+    for (int i = 0; i < batSamples; i++) {
+        batLogger1[i] = batLowLimit;
+        batLogger2[i] = batLowLimit; // Initialize all samples to the low limit
+    }
+
+    for (int i = 0; i < fuelSamples; i++) {
+        fuelLogger[i] = batLowLimit;
+    }
+
+    //initialize sensor pins
+    pinMode(battery1, INPUT); // Set battery pin as input
+    pinMode(battery2, INPUT); // Set battery pin as input
+
+    pinMode(reverseSignal, INPUT_PULLUP);
+
+    pinMode(fuelSens, INPUT); 
+    pinMode(rpmSens, INPUT);
+    pinMode(wheelSpeedSens, INPUT); // Set wheel speed sensor pin as input
+
+    pinMode(lpot1, INPUT);
+    pinMode(lpot2, INPUT); 
+
+    //intialize output pins
+    pinMode(horn, OUTPUT); // Set horn pin as output
+    digitalWrite(horn, HIGH);
+    pinMode(engineKill, OUTPUT); // Set engine kill pin as output
+    digitalWrite(engineKill, HIGH);
+
+    attachInterrupt(digitalPinToInterrupt(fuelSens), fuelRead, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(rpmSens), RPMRead, FALLING);
+    attachInterrupt(digitalPinToInterrupt(wheelSpeedSens), wheelSpeedRead, FALLING); 
+}
+
+void loop(){
+  // ALWAYS read both UART buffers first to prevent overflow
+  readAndPackageGPS();
+
+#if !(USB_PHONE_DEBUG && USB_SHARE_UART0_WITH_GPS)
+  readPhoneData();
+#endif
+
+  readPiData();
+
+  reverseCheck();
+
+  
+
+  if (millis() - phoneExportTimer >= phoneExportInterval) {
+    rpmCalculate();
+
+    wheelSpeedCalculate();
+
+    batRead(battery1, rawBattery1, battPercentage1, batLogger1, batIndex1);
+    batRead(battery2, rawBattery2, battPercentage2, batLogger2, batIndex2);
+
+    shockRead();
+
+    exportPhoneData();
+
+    phoneExportTimer = millis();
+  }
+
+  if (millis() - piCommTimer >= piCommInterval) {
+    imuService();
+
+    if (imuOK) {
+      if (!readGyro()) {
+        Phone.println("GyroReadFail");
+      }
+    }
+
+    GPSProcess();
+    formatPidata();
+    exportPiData();
+
+    piCommTimer = millis();
+  }
+                                                                                                                                                
+
+    
+    // Monitor buffer levels periodically
+    monitorBuffers();
+}
+
+//Functions called every loop of the program--------------------------------------------
+//function to collect voltage of batteries, can be called for both bats
+void batRead(int batteryPin, int &rawValue, int &percentage, int* logger, int &index) {
+    rawValue = analogRead(batteryPin); // Read raw analog value
+
+    if (rawValue > batLowLimit) {
+        updateBatAverage(rawValue, logger, index, percentage);
+    }
+}
+
+// called from within bat read, takes moving average of battery voltage
+void updateBatAverage(int rawValue, int* logger, int &index, int &percentage) {
+    logger[index] = rawValue;
+    index = (index + 1) % batSamples;
+
+    long sum = 0;
+    for (int i = 0; i < batSamples; i++) {
+        sum += logger[i];
+    }
+
+    percentage = map(sum / batSamples, batLowLimit, batHighLimit, 0, 100);
+    if (percentage < 0) percentage = 0;
+}
+
+// checks if the reverse switch is engaged, currently checks for if its grounded
+void reverseCheck(){
+    if(digitalRead(reverseSignal) == LOW){
+        reverseFlag = 1;
+    } else {
+        // No reverse signal, clear the reverse flag
+        reverseFlag = 0;
+    }
+}
+
+// //checks the three data lines from diff, should be combinations of all of
+// void diffCheck(){           //will need to confirm these configurations
+//   if(digitalRead(actuatorYellow) == HIGH){
+//     if(digitalRead(actuatorWhite) == ON){
+//         diffPosition = 2; //4wd lock
+//     }else{
+//         diffPosition = 1; //4wd
+//     }
+//   }else{
+//     diffPosition = 0; //2wd
+//   }
+// }
+
+//checks the resistance of the lpots to determine the position of the shocks
+void shockRead(){
+    rawShockPos1 = analogRead(lpot1); // read the value from the sensor
+    rawShockPos2 = analogRead(lpot2); // read the value from the sensor
+
+    shockPos1 = map(rawShockPos1, 0, 4095, 0, 100); // Map the raw value to a percentage (0-100)
+    shockPos2 = map(rawShockPos2, 0, 4095, 0, 100); // Map the raw value to a percentage (0-100)
+}
+
+//Button functions---------------------------------------------------------------------------
+//function to turn on the horn with button press, need to check if logic is sound
+void honk(){
+  if (allowedHorn == 1) {
+      if(hornButton == 1){
+          digitalWrite(horn, HIGH); // Turn on horn
+      } else {
+          digitalWrite(horn, LOW); // Turn off horn
+      }
+    }
+  if (allowedHorn == 0) {
+      digitalWrite(horn, LOW); // Turn off horn
+  }
+}
+
+//if the rev limiter is on it will cut engine itermittently to keep the engine from going over the limit
+void revLimiter(){    //only works when the allowRev flag is on
+  // if (allowRev == 1) {
+  //   if (motorLocation == 2 && twoStep == 1) { // Check if the engine is running
+  //     if(rpm > limitRPM){
+  //         digitalWrite(engineKill, HIGH); // Turn off engine kill switch
+  //     } else {
+  //         digitalWrite(engineKill, LOW); // Turn on engine kill switch
+  //     }
+  //   }
+  // }
+}
+
+//Interupt functions--------------------------------------------------------
+// Function to read fuel sensor and update fuel level using PWM
+void fuelRead() {
+    if (digitalRead(fuelSens) == HIGH && fuelFlag == 0) {
+      fuelStart = micros();
+      fuelFlag = 1;
+    } else if (digitalRead(fuelSens) == LOW && fuelFlag == 1) {
+      fuelEnd = micros();
+      fuelFlag = 0;
+      newFuelTime = 1;
+    }
+  
+    fuelTime = fuelEnd - fuelStart;
+  
+    if (fuelFlag == 0 && fuelTime > fuelLowLimit && fuelTime < fuelHighLimit && newFuelTime == 1) {
+      updateFuelAverage(fuelTime);
+      newFuelTime = 0;
+    }
+  }
+  
+  // Function to update moving average of PWM samples
+void updateFuelAverage(int newValue) {
+    fuelLogger[fuelIndex] = newValue;
+    fuelIndex = (fuelIndex + 1) % fuelSamples;
+  
+    long sum = 0;
+  
+    for (int i = 0; i < fuelSamples; i++) {
+      sum += fuelLogger[i];
+    }
+  
+    rawFuel = sum / fuelSamples;
+  
+    fuel = map(rawFuel, fuelLowLimit, fuelHighLimit, 0, 99);
+  }
+
+// Function to calculate RPM from pulse time
+void RPMRead() {
+    rpmPulseTime = micros();
+
+    if (motorLocation == 2) {      //to determine position in rotatuon relative to the magnets
+      motorLocation = 0;
+    }else{
+      motorLocation ++;
+    }
+  
+    if (rpmPulseTime < rpmPrevPulseTime) {
+      // Rollover detected
+      magInterval = (4294967295 - rpmPrevPulseTime) + rpmPulseTime;
+    } else {
+      magInterval = rpmPulseTime - rpmPrevPulseTime;
+    }
+  
+    if (magInterval > magnetDebounce) {
+      // rpmCalculate();
+      // Store pulse time
+      rpmPrevPulseTime = rpmPulseTime;
+    }
+  }
+
+// Function to calculate RPM from magnetic interval
+void rpmCalculate() {
+    if (magInterval > 0) {
+      // Convert difference into frequency (seconds domain)
+      magFreq = 60000000 / magInterval;
+    }
+  
+    // Compensate for pulses per rotation
+    rpm = magFreq / magnets;
+  }
+
+//function to colect wheel speed input
+void wheelSpeedRead(){
+    wheelPulseTime = micros();
+
+    // Handle micros() overflow
+    if (wheelPulseTime < wheelPrevPulseTime) {
+      toothInterval = (4294967295 - wheelPrevPulseTime) + wheelPulseTime;
+    } else {
+      toothInterval = wheelPulseTime - wheelPrevPulseTime;
+    }
+    
+    if (toothInterval > 150 ) { // Avoid noise
+      // wheelSpeedCalculate();
+      wheelPrevPulseTime = wheelPulseTime;
+    }
+}
+
+//calculate wheel speed using RPM of gearbox output and ratio to front tires
+void wheelSpeedCalculate() {
+    if (toothInterval > 0) {
+      toothFreq = 60000000 / toothInterval; // Frequency in Hz
+      wheelSpeed = (toothFreq / (float)teeth) * wheelRatio;                       // RPM = frequency / teeth per rotation
+      wheelSpeed = round(wheelSpeed * 10.0) / 10.0; // Round to 1 decimal place
+    }
+  }
+
+//Functions for sending and recieving data ---------------------------------------------------
+// Function to read data from phone
+void readPhoneData() {
+    int bytesRead = 0;
+    const int MAX_BYTES_PER_LOOP = 32;  // Limit bytes per loop iteration
+    
+    while (Phone.available() > 0 && bytesRead < MAX_BYTES_PER_LOOP) {
+      char c = Phone.read();
+      bytesRead++;
+  
+      // Check if a complete message has been received
+      if (c == ',') {
+        // Process the complete message
+        processPhoneData(incomingPhoneData);
+  
+        // Clear the buffer for the next message
+        incomingPhoneData = "";
+      } else if(c != '\n'){
+        incomingPhoneData += c;
+      }
+    }
+    
+    // Clear excessive backlog if buffer is getting too full
+    if (Phone.available() > 128) {
+        // Serial.println("Warning: Phone RX buffer high, clearing excess");
+        while (Phone.available() > 64) {
+            Phone.read();  // Discard oldest data
+        }
+    }
+}
+
+//switch cases to read the data from the phone
+void processPhoneData(String data) {
+    int dataIndex = data.indexOf(':');
+    if (dataIndex == -1) return;
+    
+    String key = data.substring(0, dataIndex);
+    String value = data.substring(dataIndex + 1);
+    
+    if (key == "CAR_NUM") {
+        carNumber = value.toInt();
+        // Handle car number update here
+        }
+    else if (key == "BEST_LAP") {
+        bestLap = value.toInt(); // in ms
+        // Store/display best lap time
+        }
+    else if (key == "LAST_LAP") {
+        lastLap = value.toInt(); // in ms
+        // Store/display last lap time
+        }
+    else if (key == "RACE_TIMER") {
+        raceTimer = value.toInt(); // in ms
+        // Store/display race timer
+        }
+    else if (key == "START_TIMER") {
+        startSignal = value.toInt();
+        if (startSignal == 1) {
+            // Start race timer
+            }
+        }
+}
+uint8_t makeFlags() {
+  return (reverseFlag ? (1 << 0) : 0) |
+         (panicStatus ? (1 << 1) : 0) |
+         (muteStatus  ? (1 << 2) : 0) |
+         (twoStep     ? (1 << 3) : 0) |
+         (imuOK       ? (1 << 4) : 0);
+}
+
+void exportPhoneData() {
+  char buf[180];
+
+  int wheel_x10 = (int)lroundf(wheelSpeed * 10.0f);
+
+  // ~1.1m resolution
+  int32_t lat_e5  = (int32_t)lroundf(gpsLat * 100000.0f);
+  int32_t lon_e5  = (int32_t)lroundf(gpsLon * 100000.0f);
+
+  int16_t spd_x10 = (int16_t)lroundf(gpsSpeedKph * 10.0f);
+  uint16_t hdop_x10 = (uint16_t)lroundf(gpsHdop * 10.0f);
+
+  uint8_t flags =
+    (reverseFlag ? (1 << 0) : 0) |
+    (panicStatus ? (1 << 1) : 0) |
+    (muteStatus  ? (1 << 2) : 0) |
+    (twoStep     ? (1 << 3) : 0) |
+    (imuOK       ? (1 << 4) : 0) |
+    (gpsFix      ? (1 << 5) : 0);  // optional: also include fix in flags
+
+  // rpm,wheel_x10,b1,b2,fuel,diff,flags,ax,ay,az,gx,gy,gz,lat_e7,lon_e7,spd_x10,sats,hdop_x10,fix
+  int n = snprintf(buf, sizeof(buf),
+    "%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%ld,%ld,%d,%u,%u,%u,%u,%lu,%d,%d\n",
+    rpm,
+    wheel_x10,
+    battPercentage1,
+    battPercentage2,
+    fuel,
+    diffPosition,
+    (unsigned)flags,
+    ax, ay, az,
+    gx, gy, gz,
+    (long)lat_e5,
+    (long)lon_e5,
+    (int)spd_x10,
+    (unsigned)gpsSats,
+    (unsigned)hdop_x10,
+    (unsigned)gpsFix,
+    (unsigned long)bootCount,
+    (unsigned)aliveStage,
+    shockPos1, shockPos2
+  );
+
+  if (n > 0 && n < (int)sizeof(buf)) {
+    safePhoneWrite((uint8_t*)buf, (size_t)n);
+
+ // Phone = your RFD UART
+  }
+}
+
+// Function to read data from Pi via UART
+void readPiData() {
+    int bytesRead = 0;
+    const int MAX_BYTES_PER_LOOP = 32;  // Limit bytes per loop iteration
+    
+    while (Pi.available() > 0 && bytesRead < MAX_BYTES_PER_LOOP) {
+        char c = Pi.read();
+        bytesRead++;
+        
+        if (c == '\n' || c == '\r') {
+            if (incomingPiData.length() > 0) {
+                processPiData(incomingPiData);
+                incomingPiData = "";
+            }
+        } else if (incomingPiData.length() < MAX_PI_BUFFER) {
+            incomingPiData += c;
+        } else {
+            // Buffer overflow protection - discard and reset
+            incomingPiData = "";
+            // Serial.println("Pi buffer overflow - reset");
+        }
+    }
+    
+    // Clear excessive backlog if buffer is getting too full
+    if (Pi.available() > 128) {
+        // Serial.println("Warning: Pi RX buffer high, clearing excess");
+        while (Pi.available() > 64) {
+            Pi.read();  // Discard oldest data
+        }
+    }
+}
+
+// Function to process data received from Pi
+void processPiData(String data) {
+    // ADD THIS DEBUG OUTPUT TO SEE ALL INCOMING DATA
+    // Serial.print("Raw Pi data received: '");
+    // Serial.print(data);
+    // Serial.println("'");
+    
+    // Parse Pi button data - expecting format like "BTN:15" where 15 is the button states
+    if (data.startsWith("BTN:")) {
+        String buttonData = data.substring(4);
+        uint8_t receivedData = buttonData.toInt();
+        
+        // ADD THIS DEBUG OUTPUT TO SEE THE PARSED VALUES
+        // Serial.print("Button data parsed: ");
+        // Serial.print(buttonData);
+        // Serial.print(" -> decimal: ");
+        // Serial.print(receivedData);
+        // Serial.print(" -> binary: ");
+        // Serial.println(receivedData, BIN);
+        
+        processPiButtons(receivedData);
+    }
+    else if (data.startsWith("HORN_ALLOW:")) {
+        String allowData = data.substring(12);
+        allowedHorn = allowData.toInt();
+    }
+    else if (data.startsWith("RT:")) {
+      // set the piTimer variable to the RT timer, first convert RT value to ms from seconds
+        String rtData = data.substring(3);
+        piTimer = rtData.toInt() * 1000; // Convert seconds to milliseconds
+    }
+}
+
+//check for mode cycling
+unsigned long lastReleaseTime = 0;
+unsigned long currentReleaseTime = 0;
+int releaseCount = 0;
+const unsigned long doubleReleaseThreshold = 500;  // 500ms threshold for double release
+
+void processPiButtons(uint8_t receivedData) {
+    uint8_t changedButtons = receivedData ^ lastButtonStates;
+
+    bool button1Pressed = receivedData & (1 << 0);  // Button 1 is bit 0
+    bool button2Pressed = receivedData & (1 << 1);  // Button 2 is bit 1
+    bool button3Pressed = receivedData & (1 << 2);  // Button 3 is bit 2 (two step)
+    bool button4Pressed = receivedData & (1 << 3);  // Button 4 is bit 3 (horn)
+
+    // Add these variables at the top with your other button variables
+    unsigned long lastButton2ChangeTime = 0;
+    const unsigned long BUTTON2_DEBOUNCE = 100;  // 100ms debounce for button 2
+
+    // --- ESP RESET: All 4 buttons for 3s (use separate timer) ---
+    static unsigned long resetPressTime = 0;
+    if (button1Pressed && button2Pressed && button3Pressed && button4Pressed) {
+        if (resetPressTime == 0) {
+            resetPressTime = millis();  // Start timing for reset
+            // Serial.println("All 4 buttons pressed - reset timer started");
+        } else if (millis() - resetPressTime >= 3000) {
+            // Serial.println("Resetting ESP32...");
+            ESP.restart();  // Reset the ESP32
+        }
+    } else {
+        if (resetPressTime > 0) {
+            // Serial.println("Not all buttons pressed - reset timer cleared");
+        }
+        resetPressTime = 0;  // Reset press time if not all buttons pressed
+    }
+
+    // --- Button 1: Press-and-hold for 3s to toggle panic, double-tap for mode ---
+    if (button1Pressed) {
+        if (button1PressTime == 0) {
+            button1PressTime = millis();  // Start timing
+        } else if (!button1Held && millis() - button1PressTime >= 3000) {
+            panicStatus = !panicStatus;
+            button1Held = true;  // Prevent retriggering
+        }
+    } else {
+        // Button 1 was released
+        if (button1PressTime > 0) {
+            unsigned long pressDuration = millis() - button1PressTime;
+            
+            if (button1Held) {
+                // This was a long press (panic), don't process as mode change
+                button1Held = false;
+            } else if (pressDuration < 3000) {
+                // This was a short press, check for double-tap mode change
+                currentReleaseTime = millis();
+                if (currentReleaseTime - lastReleaseTime <= doubleReleaseThreshold) {
+                    releaseCount++;
+                    if (releaseCount == 2) {
+                        mode = (mode + 1) % 3;
+                        releaseCount = 0;
+                    }
+                } else {
+                    releaseCount = 1;
+                }
+                lastReleaseTime = currentReleaseTime;
+            }
+            // If pressDuration >= 3000 but button1Held wasn't set, ignore it
+            
+            button1PressTime = 0;  // Reset press time
+        }
+    }
+
+    // --- Button 2: FILTERED mute toggle ---
+    if ((changedButtons & (1 << 1)) && button2Pressed && !lastButton2State) {
+        unsigned long currentTime = millis();
+        
+        // FILTER: Ignore button 2 if it happens too close to button 1 activity
+        if (button1PressTime > 0 && (currentTime - button1PressTime) < 200) {
+            // Serial.println("Button 2 press FILTERED - too close to button 1 press");
+        }
+        // FILTER: Ignore rapid button 2 changes (debounce)
+        else if (currentTime - lastButton2ChangeTime < BUTTON2_DEBOUNCE) {
+            // Serial.println("Button 2 press FILTERED - too rapid");
+        }
+        // FILTER: Ignore if button 1 is currently held for panic
+        else if (button1Held) {
+            // Serial.println("Button 2 press FILTERED - button 1 is held for panic");
+        }
+        else {
+            muteStatus = !muteStatus;
+            // Serial.println("MUTE TOGGLED! (Legitimate button 2 press)");
+        }
+        
+        lastButton2ChangeTime = currentTime;
+    }
+    lastButton2State = button2Pressed;
+
+    // --- Button 3: Toggle two step ---
+    if ((changedButtons & (1 << 2)) && button3Pressed) {
+        twoStep = !twoStep;
+        // Serial.println("Two step toggled!");
+    }
+    
+    // --- Button 4: Horn control ---
+    if ((changedButtons & (1 << 3))) {
+        hornButton = button4Pressed ? 1 : 0;
+        // Serial.print("Horn button: ");
+        // Serial.println(hornButton);
+    }
+
+    // Optional: Print button state changes (for debugging)
+    for (int i = 0; i < BUTTON_COUNT; i++) {
+        if (changedButtons & (1 << i)) {
+            if (receivedData & (1 << i)) {
+                // Serial.print("Button ");
+                // Serial.print(i + 1);
+                // Serial.println(" pressed!");
+            } else {
+                // Serial.print("Button ");
+                // Serial.print(i + 1);
+                // Serial.println(" released!");
+            }
+        }
+    }
+    lastButtonStates = receivedData;
+}
+
+//function to format a miliseconds time to a string in the form HHMMSS
+void formatTime(long timeInMillis, String &formattedTime) {
+    int seconds = timeInMillis / 1000;
+    int minutes = seconds / 60;
+    seconds = seconds % 60;
+    int hours = minutes / 60;
+    minutes = minutes % 60;
+
+    formattedTime = String(hours) + String(minutes) + String(seconds);
+}   
+
+void formatPidata(){
+    //below we map some of the variables to the correct values for the pi
+
+    if (reverseFlag == 1) {
+        gearState = 1; // Reverse
+    } else {
+        gearState = 2; // Forward
+    }
+
+    //convert raceTimer from ms to a string in the form HHMMSS
+    String raceTimerString = "";
+    formatTime(raceTimer, raceTimerString);
+
+    //convert bestLap and lastLap from ms to a string in the form HHMMSS
+    String bestLapString = "";
+    formatTime(bestLap, bestLapString);
+    String lastLapString = "";
+    formatTime(lastLap, lastLapString);
+
+    // Format compact string
+    piDataString =
+    "R:" + String(rpm) + 
+    ",B:" + String(battPercentage1) + 
+    ",F:" + String(fuel) + 
+    ",P:" + String(panicStatus) + 
+    ",M:" + String(muteStatus) + 
+    ",RT:" + raceTimerString + 
+    ",ST:" + String(startSignal) + 
+    ",S:" + String(wheelSpeed, 0) + 
+    ",D:" + String(diffPosition) + 
+    ",2S:" + String(twoStep) +
+    ",L:" + String(lap) + 
+    ",G:" + String(gearState) + 
+    ",C:" + String(carNumber) + 
+    ",PN:" + pos + 
+    ",PD:" + posD + 
+    ",PL:" + lastLapString + 
+    ",BL:" + bestLapString + 
+    ",MD:" + mode;
+}
+
+// void exportPiData() {
+//     Pi.println(piDataString);  // Send formatted data to Pi via UART
+//     // Serial.println("Sent to Pi: " + piDataString);  // Debug output
+// }
+
+void exportPiData() {
+  static char out[300];
+
+  int n = snprintf(out, sizeof(out),
+    "R:%d,B:%d,BD:%d,F:%d,RT:%ld,ST:%d,S:%d,D:%d,2S:%d,L:%d,G:%d,C:%d,PN:%s,PD:%s,PL:%ld,BL:%ld,MD:%d,SA:%d,SB:%d\n",
+    rpm,
+    battPercentage1,    //main battery percentage
+    battPercentage2,    //data battery percentage
+    fuel,   //removed panic and mute from output
+    raceTimer,          // NOTE: you were converting to HHMMSS string before. If Pi expects HHMMSS, see Option 1b below. this will be total time we want to show and start flag is below
+    startSignal,        //start flag for race timer
+    (int)lroundf(wheelSpeed),   //wheel speed value
+    diffPosition,   //4wd state ,next car will be 2wd or 4wd
+    twoStep,    //an indicator that ysing rev limiting
+    lap,      //lap count
+    gearState,    //Forward/Reverse, but next car will not have
+    carNumber,    //car ahead number
+    pos.c_str(),  //car ahead position
+    posD.c_str(), //car ahead position delta
+    lastLap,    //time for last lap
+    bestLap,    //best lap time
+    mode,       //current mode
+    shockPos1,  //lin pot shock position 1
+    shockPos2   //lin pot shock position 2
+  );
+
+  if (n > 0) Pi.write((uint8_t*)out, (size_t)n);
+}
+
+
+
+// Buffer monitoring function
+void monitorBuffers() {
+    static unsigned long lastMonitor = 0;
+    if (millis() - lastMonitor > 5000) {  // Check every 5 seconds
+        if (Phone.available() > 100 || Pi.available() > 100) {
+           
+        }
+        lastMonitor = millis();
+    }
+}
+
+#define WHO_AM_I      0x75
+#define SMPLRT_DIV    0x19
+#define CONFIG_REG    0x1A
+#define GYRO_CONFIG   0x1B
+#define ACCEL_CONFIG  0x1C
+#define ACCEL_CONFIG2 0x1D
+
+bool imuHandleFail() {
+  imuOK = 0;
+
+  // Clear values so stale data is obvious
+  ax = ay = az = 0;
+  gx = gy = gz = 0;
+
+  // Hard bus recovery
+  I2C_IMU.end();
+  delay(2);
+
+  i2cBusRecover(gyroData, gyroClock);
+  delay(2);
+
+  I2C_IMU.begin(gyroData, gyroClock, 25000);
+  I2C_IMU.setTimeout(2);
+  delay(2);
+
+  return false;
+}
+
+bool imuWriteReg(uint8_t reg, uint8_t val) {
+  I2C_IMU.beginTransmission(MPU_ADDR);
+  I2C_IMU.write(reg);
+  I2C_IMU.write(val);
+
+  uint8_t e = I2C_IMU.endTransmission(true);
+  if (e != 0) {
+    return imuHandleFail();
+  }
+  return true;
+}
+
+uint8_t imuRead8(uint8_t reg) {
+  I2C_IMU.beginTransmission(MPU_ADDR);
+  I2C_IMU.write(reg);
+
+  uint8_t e = I2C_IMU.endTransmission(false);
+  if (e != 0) {
+    imuHandleFail();
+    return 0xFF;
+  }
+
+  uint8_t n = I2C_IMU.requestFrom(MPU_ADDR, (uint8_t)1, (uint8_t)true);
+  if (n != 1) {
+    imuHandleFail();
+    return 0xFF;
+  }
+
+  return I2C_IMU.read();
+}
+
+bool imuPing() {
+  I2C_IMU.beginTransmission(MPU_ADDR);
+  uint8_t e = I2C_IMU.endTransmission(true);
+  return (e == 0);
+}
+
+bool imuWhoAmICheck() {
+  uint8_t who = imuRead8(WHO_AM_I);
+  return (who == 0x68 || who == 0x70 || who == 0x71);
+}
+
+bool imuTryInit() {
+  I2C_IMU.end();
+  delay(2);
+
+  i2cBusRecover(gyroData, gyroClock);
+  delay(2);
+
+  I2C_IMU.begin(gyroData, gyroClock, 25000);
+  I2C_IMU.setTimeout(2);
+  delay(20);
+
+  if (!imuPing()) return false;
+
+  if (!imuWriteReg(PWR_MGMT_1, 0x00)) return false;   // wake up
+  delay(10);
+
+  uint8_t who = imuRead8(WHO_AM_I);
+  if (!(who == 0x68 || who == 0x70 || who == 0x71)) {
+    return false;
+  }
+
+  // Conservative settings
+  if (!imuWriteReg(SMPLRT_DIV, 0x09)) return false;    // modest rate
+  if (!imuWriteReg(CONFIG_REG, 0x06)) return false;    // DLPF
+  if (!imuWriteReg(GYRO_CONFIG, 0x00)) return false;   // ±250 dps
+  if (!imuWriteReg(ACCEL_CONFIG, 0x00)) return false;  // ±2g
+  if (!imuWriteReg(ACCEL_CONFIG2, 0x06)) return false; // accel DLPF
+
+  ax = ay = az = 0;
+  gx = gy = gz = 0;
+
+  return true;
+}
+
+void imuService() {
+  if (imuOK) return;
+
+  unsigned long now = millis();
+  if (now - imuLastAttemptMs < imuRetryIntervalMs) return;
+
+  imuLastAttemptMs = now;
+
+  if (imuTryInit()) {
+    imuOK = 1;
+    imuEverOK = true;
+    imuRetryIntervalMs = 1000;
+    Phone.println("GyroConnected");
+  } else {
+    imuOK = 0;
+    imuRetryIntervalMs = min(imuRetryIntervalMs * 2, IMU_RETRY_MAX_MS);
+    Phone.println("GyroRetry");
+  }
+}
+
+bool readGyro() {
+  if (!imuOK) return false;
+
+  I2C_IMU.beginTransmission(MPU_ADDR);
+  I2C_IMU.write(ACCEL_XOUT_H);
+
+  uint8_t e = I2C_IMU.endTransmission(false);
+  if (e != 0) {
+    return imuHandleFail();
+  }
+
+  uint8_t n = I2C_IMU.requestFrom(MPU_ADDR, (uint8_t)14, (uint8_t)true);
+  if (n != 14) {
+    return imuHandleFail();
+  }
+
+  ax = ((int16_t)I2C_IMU.read() << 8) | I2C_IMU.read();
+  ay = ((int16_t)I2C_IMU.read() << 8) | I2C_IMU.read();
+  az = ((int16_t)I2C_IMU.read() << 8) | I2C_IMU.read();
+
+  I2C_IMU.read(); // temp high
+  I2C_IMU.read(); // temp low
+
+  gx = ((int16_t)I2C_IMU.read() << 8) | I2C_IMU.read();
+  gy = ((int16_t)I2C_IMU.read() << 8) | I2C_IMU.read();
+  gz = ((int16_t)I2C_IMU.read() << 8) | I2C_IMU.read();
+
+  return true;
+}
+
+void imuScanBus() {
+  int found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    I2C_IMU.beginTransmission(addr);
+    uint8_t err = I2C_IMU.endTransmission(true);
+    if (err == 0) {
+      found++;
+    }
+    delay(1);
+  }
+}
+
+void i2cBusRecover(int sda, int scl) {
+  pinMode(sda, INPUT_PULLUP);
+  pinMode(scl, OUTPUT_OPEN_DRAIN);
+
+  digitalWrite(scl, HIGH);
+  delayMicroseconds(5);
+
+  // Clock out any stuck slave state
+  for (int i = 0; i < 16; i++) {
+    if (digitalRead(sda) == HIGH) break;
+    digitalWrite(scl, LOW);
+    delayMicroseconds(8);
+    digitalWrite(scl, HIGH);
+    delayMicroseconds(8);
+  }
+
+  // STOP condition
+  pinMode(sda, OUTPUT_OPEN_DRAIN);
+  digitalWrite(sda, LOW);
+  delayMicroseconds(8);
+  digitalWrite(scl, HIGH);
+  delayMicroseconds(8);
+  digitalWrite(sda, HIGH);
+  delayMicroseconds(8);
+
+  pinMode(sda, INPUT_PULLUP);
+  pinMode(scl, INPUT_PULLUP);
+}
+void GPSProcess() {
+  while (GPS.available()) {
+    gps.encode(GPS.read());
+    //Phone.println("Available");
+  }
+
+  gpsFix = gps.location.isValid() ? 1 : 0;
+
+  //Phone.print("GPS Fix: ");
+  //Phone.println(gpsFix);
+
+  if (gps.location.isUpdated()) {
+    gpsLat = gps.location.lat();
+    gpsLon = gps.location.lng();
+  }
+
+  if (gps.speed.isUpdated()) {
+    gpsSpeedKph = gps.speed.kmph();
+  }
+
+  if (gps.satellites.isUpdated()) {
+    gpsSats = gps.satellites.value();
+  }
+
+  if (gps.hdop.isUpdated()) {
+    gpsHdop = gps.hdop.hdop();   // HDOP as float
+  }
+
+  if (gps.altitude.isUpdated()) {
+    gpsAltM = gps.altitude.meters();
+  }
+}
+void GPSCaptureNMEA() {
+  static char line[120];
+  static uint8_t idx = 0;
+
+  int moved = 0;
+  while (GPS.available() && moved < 256) {
+    char c = (char)GPS.read();
+    moved++;
+
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      line[idx] = '\0';
+      idx = 0;
+
+      // Only keep RMC/GGA (GN or GP)
+      bool ok =
+        (strncmp(line, "$GPRMC", 6) == 0) || (strncmp(line, "$GNRMC", 6) == 0) ||
+        (strncmp(line, "$GPGGA", 6) == 0) || (strncmp(line, "$GNGGA", 6) == 0);
+
+      if (ok) {
+        // Copy + SANITIZE so it doesn't break CSV:
+        // - replace commas with ';'
+        // - replace any quotes with apostrophe
+        // - limit length to lastNMEA buffer
+        size_t w = 0;
+        for (size_t i = 0; line[i] && w < sizeof(lastNMEA) - 1; i++) {
+          char ch = line[i];
+          if (ch == ',') ch = ';';
+          if (ch == '"') ch = '\'';
+          lastNMEA[w++] = ch;
+        }
+        lastNMEA[w] = '\0';
+        lastNMEAMs = millis();
+      }
+      continue;
+    }
+
+    if (idx < sizeof(line) - 1) {
+      line[idx++] = c;
+    } else {
+      idx = 0; // overflow reset
+    }
+  }
+}
+
+void exportNMEAtoPhone() {
+  static uint32_t lastSend = 0;
+  if (millis() - lastSend < 1500) return; // 1 Hz
+  lastSend = millis();
+
+  GPSCaptureNMEA();
+  if (lastNMEA[0] == '\0') return;
+
+  char out[140];
+  int n = snprintf(out, sizeof(out), "NMEA,%lu,\"%s\"\n",
+                   (unsigned long)lastNMEAMs, lastNMEA);
+  if (n > 0 && n < (int)sizeof(out)) safePhoneWrite((uint8_t*)out, (size_t)n);
+}
+
+
+
+bool imuTransactionFailed() {
+  imuOK = 0;
+
+  I2C_IMU.end();
+  delay(2);
+
+  i2cBusRecover(gyroData, gyroClock);
+  delay(2);
+
+  I2C_IMU.begin(gyroData, gyroClock, 100000);
+  I2C_IMU.setTimeout(2);
+  delay(2);
+
+  return false;
+}
+
+bool imuWriteRegChecked(uint8_t reg, uint8_t val) {
+  I2C_IMU.beginTransmission(MPU_ADDR);
+  I2C_IMU.write(reg);
+  I2C_IMU.write(val);
+  return (I2C_IMU.endTransmission(true) == 0);
+}
+
+
+static inline void safePhoneWrite(const uint8_t* data, size_t n) {
+  // If the buffer is too full, just drop this frame (better than freezing)
+  if (Phone.availableForWrite() < (int)n) return;
+  Phone.write(data, n);
+}
+
+void readAndPackageGPS() {
+  static char rawSentence[120];
+  static int idx = 0;
+
+  while (GPS.available()) {
+    char c = GPS.read();
+    
+    // 1. Feed the math library to get your coordinates
+    gps.encode(c);
+
+    // 2. Build the raw sentence character by character
+    if (c == '\n') {
+      rawSentence[idx] = '\0'; // End the string
+      idx = 0; // Reset for the next sentence
+      
+      // 3. Send the packaged raw sentence to the "Phone" ESP32!
+      // We add "RAWGPS:" to the front so the second ESP32 knows what it is
+      //Phone.print("RAWGPS:");
+      //Phone.println(rawSentence); 
+      
+    } else if (c != '\r' && idx < sizeof(rawSentence) - 1) {
+      rawSentence[idx++] = c;
+    }
+  }
+
+  // 4. Update your normal variables for the telemetry string
+  gpsFix = gps.location.isValid() ? 1 : 0;
+
+  if (gps.location.isUpdated()) {
+    gpsLat = gps.location.lat();
+    gpsLon = gps.location.lng();
+  }
+
+  if (gps.speed.isUpdated()) {
+    gpsSpeedKph = gps.speed.kmph();
+  }
+
+  if (gps.satellites.isUpdated()) {
+    gpsSats = gps.satellites.value();
+  }
+
+  if (gps.hdop.isUpdated()) {
+    gpsHdop = gps.hdop.hdop();
+  }
+
+  if (gps.altitude.isUpdated()) {
+    gpsAltM = gps.altitude.meters();
+  }
+}
